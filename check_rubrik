@@ -1,0 +1,371 @@
+#!/usr/bin/perl -w
+# License: GPL
+# Author: florian@sanys.fr
+# History version -----
+# Version: 1.0.0 : First Build 2017/11/15 
+
+
+use strict;
+use warnings;
+use vars qw($PROGNAME $VERSION $output $values $result);
+use REST::Client;
+use File::Basename;
+use Nagios::Plugin;
+use Data::Dumper;
+use MIME::Base64;
+use JSON::XS;
+
+$ENV{'PERL_LWP_SSL_VERIFY_HOSTNAME'} = 0;
+
+$PROGNAME = basename($0);
+
+$VERSION = '1.0.0';
+
+my $np = Nagios::Plugin->new(
+  usage => "Usage: %s | -H <host_name> \n"
+    . "    -u <user> -p <pass> | -f <authfile>\n"
+    . "    -l <command> \n"
+    . "    [ -t <timeout> ] [ -w <warn_range> ] [ -c <crit_range> ]\n"
+    . '    [ -V ] [ -h ]',
+  version => $VERSION,
+  plugin  => $PROGNAME,
+  shortname => $PROGNAME,
+  blurb => 'Rubrik plugin check',
+  extra   => "Supported commands(^ means blank or not specified parameter) :\n"
+    . "    Actions on Rubrik node\n"
+    . "        * node - check node status\n"
+    . "        * runway - check runway available\n"
+    . "        * storage - shows percent available\n"
+    . "        * tasks - check status of the tasks\n",
+  timeout => 30,
+);
+
+
+$np->add_arg(
+  spec => 'host|H=s',
+  help => "-H, --host=<hostname>\n"
+    . '   Rubrik Edge or Brik.',
+  required => 0,
+);
+
+$np->add_arg(
+  spec => 'username|u=s',
+  help => "-u, --username=<username>\n"
+    . '   Username to connect with.',
+  required => 0,
+);
+
+$np->add_arg(
+  spec => 'password|p=s',
+  help => "-p, --password=<password>\n"
+    . '   Password to use with the username.',
+  required => 0,
+);
+
+$np->add_arg(
+  spec => 'authfile|f=s',
+  help => "-f, --authfile=<path>\n"
+    . "   Authentication file with login and password. File syntax :\n"
+    . "   username=<login>\n"
+    . '   password=<password>',
+  required => 0,
+);
+
+$np->add_arg(
+  spec => 'warning|w=s',
+  help => "-w, --warning=THRESHOLD\n"
+    . "   Warning threshold. See\n"
+    . "   http://nagiosplug.sourceforge.net/developer-guidelines.html#THRESHOLDFORMAT\n"
+    . '   for the threshold format.',
+  required => 0,
+);
+
+$np->add_arg(
+  spec => 'critical|c=s',
+  help => "-c, --critical=THRESHOLD\n"
+    . "   Critical threshold. See\n"
+    . "   http://nagiosplug.sourceforge.net/developer-guidelines.html#THRESHOLDFORMAT\n"
+    . '   for the threshold format.',
+  required => 0,
+);
+
+$np->add_arg(
+  spec => 'command|l=s',
+  help => "-l, --command=COMMAND\n"
+    . '   Specify command type (CPU, MEM, NET, IO, VMFS, RUNTIME, ...)',
+  required => 1,
+);
+
+# Get the information from the command launched
+$np->getopts;
+my $host = $np->opts->host;
+my $username = $np->opts->username;
+my $password = $np->opts->password;
+my $authfile = $np->opts->authfile;
+my $warning = $np->opts->warning;
+my $critical = $np->opts->critical;
+my $command = $np->opts->command;
+
+## Default value
+$output = "Unknown ERROR!";
+$result = CRITICAL;
+
+
+## Default values Warning and Critical
+my $default_warning_runaway = 50;
+my $default_critical_runaway = 25;
+my $default_warning_tasks = 1;
+my $default_critical_tasks = 0;
+my $default_warning_storage = 20;
+my $default_critical_storage = 10;
+
+# Check that host and credentials have been mentionned
+die "Host nor correct\n" if ((!defined($host) ));
+die "Provide either Password/Username or Auth file or Session file\n" if ((!defined($password) || !defined($username)) &&  !defined($authfile));
+if (defined($authfile)){
+  open (AUTH_FILE, $authfile) || die "Unable to open auth file \"$authfile\"\n";
+    while( <AUTH_FILE> ) {
+    if(s/^[ \t]*username[ \t]*=//){
+      s/^\s+//;s/\s+$//;
+      $username = $_;
+    }
+    if(s/^[ \t]*password[ \t]*=//){
+      s/^\s+//;s/\s+$//;
+      $password = $_;
+    }
+    }
+    die "Auth file must contain both username and password\n" if (!(defined($username) && defined($password)));
+}
+
+
+if (defined($command)){
+	$command = uc($command);
+
+	# Check Nodes --------------------------------------------------------------------------------------------------------------	
+	if ($command eq "NODE"){
+	
+		# Get the information from API
+		my $endpoint = "/api/internal/cluster/me/node";
+		my $headers = {Accept => 'application/json', Authorization => 'Basic ' . encode_base64($username . ':' . $password)};
+		my $client = REST::Client->new();
+		$client->setHost("https://$host");
+		$client->GET(
+			"$endpoint",
+			$headers
+		);
+		my $response = $client->responseContent();
+		my $response_json = decode_json $response;
+		my $numberNodes = $response_json->{'total'};
+
+
+		# Check the current status of the nodes of the Brik or Edge
+		my $status = "OK";
+		my @nodes = @{ $response_json->{'data'}};
+
+		foreach my $node (@nodes){
+			my $result =  $node->{"status"};
+			if ($result ne "OK"){
+				$status = $result;
+			}
+		}
+
+		# Exit with the correct status
+		if($status eq "OK"){
+		my $output =  "Status of the $numberNodes node(s) is/are OK";
+		my $codeResult = 0;
+		$np->nagios_exit($codeResult, $output);
+		}
+		
+		else{
+			my $output = "One or multiple nodes are in Critical states";
+			my $codeResult = 2;
+			$np->nagios_exit($codeResult, $output);
+		}
+	}
+
+
+	# Check Runway --------------------------------------------------------------------------------------------------------------
+	elsif ($command eq "RUNAWAY"){
+	
+		# Define the Warning and critical value
+		my $warning_runaway = 0;
+		my $critical_runaway = 0;
+		if (!defined($warning)){ $warning_runaway = $default_warning_runaway;}
+		else { $warning_runaway = $warning;}
+
+		if (!defined($critical)) { $critical_runaway = $default_critical_runaway;}
+		else { $critical_runaway = $critical;}
+
+		# Get the information from API
+		my $endpoint = "/api/internal/stats/runway_remaining";
+		my $headers = {Accept => 'application/json', Authorization => 'Basic ' . encode_base64($username . ':' . $password)};
+		my $client = REST::Client->new();
+		$client->setHost("https://$host");
+		$client->GET(
+			"$endpoint",
+			$headers
+		);
+
+
+		my $response = $client->responseContent();
+		my $response_json = decode_json $response;
+		my $runaway_days = $response_json->{'days'};
+
+		# Exit with the correct status
+		if( int($runaway_days) >= int($warning_runaway)){
+			my $output =  "Estimated runway $runaway_days days";
+			my $codeResult = 0;
+			$np->nagios_exit($codeResult, $output);
+		}
+		elsif($runaway_days >= $critical_runaway){
+			my $output = "Estimated runway $runaway_days days";
+			my $codeResult = 1;
+			$np->nagios_exit($codeResult, $output);
+		}
+		else{
+			my $output = "Estimated runway $runaway_days days";
+			my $codeResult = 2;
+			$np->nagios_exit($codeResult, $output);
+		}
+    }
+
+	# Check Tasks --------------------------------------------------------------------------------------------------------------
+    elsif ($command eq "TASKS"){
+	
+		# Define the Warning and critical value
+        my $warning_tasks = 0;
+        my $critical_tasks = 0;
+
+        if (!defined($warning)){ $warning_tasks = $default_warning_tasks;}
+        else { $warning_tasks = $warning;}
+
+        if (!defined($critical)) { $critical_tasks = $default_critical_tasks;}
+        else { $critical_tasks = $critical;}
+
+        #Get the report ID number of the task report
+        my $endpoint = "/api/internal/report?report_type=Canned&search_text=Protection Tasks Details";
+        my $headers = {Accept => 'application/json', Authorization => 'Basic ' . encode_base64($username . ':' . $password)};
+        my $client = REST::Client->new();
+        $client->setHost("https://$host");
+        $client->GET(
+            "$endpoint",
+            $headers
+        );
+
+        my $response = $client->responseContent();
+        my $response_json = decode_json $response;
+        my $detail_report_id = "";
+
+
+
+        my @reports = @{ $response_json->{"data"}};
+        foreach my $report ( @reports ) {
+            $detail_report_id = $report->{"id"};
+        }
+
+		# Get the information of the report: Tasks failed and succesfull
+        my $endpoint2 = "/api/internal/report/$detail_report_id/chart?timezone_offset=0&chart_id=chart0";
+        $client->GET(
+            "$endpoint2",
+            $headers
+        );
+        my $response2 = $client->responseContent();
+        my $response_json2 = decode_json $response2;
+        my $tasks_succeeded = 0;
+        my $tasks_failed = 0;
+
+
+        my $tasks = $response_json2->[0]{dataColumns};
+
+
+        for my $taskType (@$tasks) {
+
+            if ($taskType->{label} eq "Succeeded")
+            {
+                my @columnData = @{$taskType->{'dataPoints'}};
+                foreach my $i ( @columnData )
+                {
+                    $tasks_succeeded = $i->{'value'};
+                }
+            }
+            elsif ($taskType->{"label"} eq "Failed")
+            {
+                my @columnData = @{$taskType->{'dataPoints'}};
+                foreach my $i ( @columnData )
+                {
+                    $tasks_failed = $i->{'value'};
+                }
+  
+            }
+        }
+
+		# Exit with the correct status
+        if ($tasks_failed >=  $critical_tasks){
+            my $output = "$tasks_failed task(s) failed, $tasks_succeeded task(s) succeeded";
+            my $codeResult = 2;
+            $np->nagios_exit($codeResult, $output);
+        }
+        elsif ( $tasks_failed >= $warning_tasks){
+            my $output = "$tasks_failed task(s) failed, $tasks_succeeded task(s) succeeded";
+            my $codeResult = 1;
+            $np->nagios_exit($codeResult, $output);
+        }
+        else{
+            my $output = "$tasks_failed task(s) failed, $tasks_succeeded task(s) succeeded";
+            my $codeResult = 0;
+            $np->nagios_exit($codeResult, $output);
+        }
+    }
+
+	elsif ($command eq "STORAGE"){
+		
+		# Define the Warning and critical value
+		my $warning_storage = 0;
+		my $critical_storage = 0;
+		if (!defined($warning)){ $warning_storage = $default_warning_storage;}
+		else { $warning_storage = $warning;}
+		if (!defined($critical)) { $critical_storage = $default_critical_storage;}
+		else { $critical_storage = $critical;}
+
+		# Get the information from API
+		my $endpoint = "/api/internal/stats/system_storage";
+		my $headers = {Accept => 'application/json', Authorization => 'Basic ' . encode_base64($username . ':' . $password)};
+		my $client = REST::Client->new();
+		$client->setHost("https://$host");
+		$client->GET(
+			"$endpoint",
+			$headers
+		);
+
+		my $response = $client->responseContent();
+		my $response_json = decode_json $response;
+
+		my $result_data_total = $response_json->{'total'} / (1000 * 1000 * 1000);
+		my $result_data_available = $response_json->{'available'} / (1000 * 1000 * 1000);
+		my $result_data_available_percent = $result_data_available * 100 / $result_data_total;
+
+
+
+		if( $result_data_available_percent <= $critical_storage){
+			my $output =  "$result_data_available_percent percentage available";
+			my $codeResult = 2;
+			$np->nagios_exit($codeResult, $output);
+		}
+			
+		elsif($result_data_available_percent <= $warning_storage){
+			my $output = "$result_data_available_percent percentage available";
+			my $codeResult = 1;
+			$np->nagios_exit($codeResult, $output);
+		}
+		
+		else{
+			my $output = "$result_data_available_percent percentage available";
+			my $codeResult = 0;
+			$np->nagios_exit($codeResult, $output);
+		}
+	}
+
+
+	else{print "unknown command";}
+}
+
