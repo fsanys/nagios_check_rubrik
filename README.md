@@ -8,10 +8,10 @@ This is a simple Nagios check script to monitor your Rubrik Physical or Virtual 
 
 Check Rubrik Edge (Virtual appliance) or Brik (Physical appliance).
 The scripts has 4 checks available:
-- node - check node statusn"
-- runway - check runway availablen"
-- storage - shows percent availablen"
-- tasks - check status of the tasks"
+- node - check node status
+- runway - check runway available
+- storage - shows percent available
+- tasks - check status of the tasks
 
 
 
